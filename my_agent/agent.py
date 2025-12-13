@@ -3,6 +3,7 @@ import asyncio
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.tool_context import ToolContext
 from google.adk.runners import Runner
 from google.genai import types
 from typing import Optional
@@ -19,26 +20,83 @@ print("Libraries imported successfully")
 
 MODEL_GPT_40 = 'openai/gpt-4o'
 
+session_service_stateful = InMemorySessionService()
+print("New InMemorySessionService created for sate demonstration.")
+
+SESSION_ID_STATEFUL = "session_state-demo_001"
+USER_ID_STATEFUL = "user_state_demo"
+
+APP_NAME = "muliagent"
+
+initial_state = {
+    "user_preference_temperature_unit": "Celsius"
+}
+async def create_session():
+    session_stateful = await session_service_stateful.create_session(
+        app_name= APP_NAME,
+        user_id=USER_ID_STATEFUL,
+        session_id=SESSION_ID_STATEFUL,
+        state=initial_state
+    )
+    print(f"Session {SESSION_ID_STATEFUL} created for user {USER_ID_STATEFUL}")
+
+    retrieved_session = await session_service_stateful.get_session(app_name=APP_NAME, user_id=USER_ID_STATEFUL, session_id= SESSION_ID_STATEFUL)
+
+    print("\n --- Initial Session State ---")
+    if retrieved_session:
+        print(retrieved_session.state)
+    else:
+        print("Error: Could not retrieve session.")
+
 # Weather Tool
-def get_weather(city: str) -> dict:
-    """Retrieve the current weather report for a specified city."""
+def get_weather_stateful(city: str, tool_context: ToolContext) -> dict:
+    """Retrieves weather, conberts temp unit based on session state."""
     print(f"--- Tool: get_weather called for {city}")
+
+    #--- Read prefernce form state ---
+    preferred_unit = tool_context.state.get("user_preference_temperature_unit", "Celsius")
+    print(f" ---Tool: Reading state 'user_preference_temperature_unit': {preferred_unit}")
     city_normalized = city.lower().replace(" ", "")
 
     # Mock weather data
     mock_weather_data = {
-        "dhaka": {"status": "success", "report": "The weather in Dhaka is sunny with a temperature of 25°C"},
-        "rangpur": {"status": "success", "report": "The weather in Rangpur is quite windy with a temperature of 15°C. So cold."},
-        "chandpur": {"status": "success", "report": "Chandpur is experiencing light rain and a temperature of 18°C."},
+        "dhaka": {"temp_c": 25, "condition": "sunny"},
+        "rangpur": {"temp_c": 15, "condition": "cloudy"},
+        "chandpur": {"temp_c": 18, "condition": "light rain"},
     }
 
     if city_normalized in mock_weather_data:
-        return mock_weather_data[city_normalized]
+        data = mock_weather_data[city_normalized]
+        temp_c = data['temp_c']
+        condition = data["condition"]
+
+        if preferred_unit == "Fahrenheir":
+            temp_value = (temp_c * 9/5) + 32
+            temp_unit = "°F"
+        else:
+            temp_value = temp_c
+            temp_unit = "°C"
+
+        report = f"The weather in {city.capitalize} is {condition} with a temperature of {temp_value:.0f} {temp_unit}."
+        result = {
+            "status": "success",
+            "report": report
+        }
+        print(f"--- Tool: Generated report in {preferred_unit}. Result: {result} ---")
+
+        tool_context.state["last_city_checked_statefull"] = city
+        print(f" ---Tool: Update sate 'last_city_checked_stateful': {city} ----")
+        return result
+
     else:
+        error_msg = f"Sorry, I don't have weather information for '{city}'."
+        print(f"----Tool: City {city} not found----")
         return {
             "status": "error",
-            "error_message": f"Sorry, I don't have weather information for {city}."
+            "error_message": error_msg
         }
+    
+print("State-awre 'get_weather_stateful' tool defined.")
 
 # Greeting Tool
 def say_hello(name: Optional[str] = None) -> str:
@@ -59,17 +117,14 @@ def say_goodbye() -> str:
 
 print("Greeting and Farewell tools defined.")
 
-# ---- Greeting Agent ----
+# ---- Redefine Greeting Agent ----
 greeting_agent = None
 try:
     greeting_agent = Agent(
         model=LiteLlm(model=MODEL_GPT_40),
         name="greeting_agent",
         instruction=(
-            "You are the Greeting Agent. Your ONLY task is to provide a friendly greeting to the user. "
-            "Use the 'say_hello' tool to generate the greeting."
-            "If the user provides their name, make sure to pass it to the tool. "
-            "Do not engage in any other conversation or tasks."
+            "You are the Greeting Agent. Your ONLY task is to provide a friendly greeting using the 'say_hello' tool. Do nothing else."
         ),
         description="Handles simple greetings and hellos using the 'say_hello' tool.",
         tools=[say_hello],
@@ -78,15 +133,14 @@ try:
 except Exception as e:
     print(f"Could not create Greeting agent. Error: {e}")
 
-# ---- Farewell Agent ----
+# ---- Redefine  Farewell Agent ----
 farewell_agent = None
 try:
     farewell_agent = Agent(
         name="farewell_agent",
         model=LiteLlm(MODEL_GPT_40),
         description=(
-            "You are the Farewell Agent. Your ONLY task is to provide a polite goodbye message. "
-            "Use the 'say_goodbye' tool when the user indicates they are leaving or ending the conversation."
+            "You are the Farewell Agent. Your ONLY task is to provide a polite goodbye message using the 'say_goodbye' tool. Do not perform any other actions."
         ),
         instruction="Handles simple farewells and goodbyes using the 'say_goodbye' tool.",
         tools=[say_goodbye],
@@ -95,29 +149,37 @@ try:
 except Exception as e:
     print(f"Could not create Farewell agent. Error: {e}")
 
+# --- Define the Updated Root Agent ---
+root_agent = None
+runner_root_stateful = None 
+
 # Create root agent if sub-agents exist
-if greeting_agent and farewell_agent and 'get_weather' in globals():
+if greeting_agent and farewell_agent and 'get_weather_stateful' in globals():
     root_agent_model = MODEL_GPT_40
 
     root_agent = Agent(
-        name="weather_agent_v2",
+        name="weather_agent_v4_stateful",
         model=root_agent_model,
         description=(
-            "The main coordinator agent. Handles weather requests and delegates greetings/farewells to specialists."
+            "Main agent: Provides weather (state-aware unit), delegates greetings/farewells, saves report to state."
         ),
         instruction=(
-            "You are the main Weather Agent coordinating a team. Your primary responsibility is to provide weather information. "
-            "Use the 'get_weather' tool ONLY for specific weather requests. (e.g., 'weather in Dhaka'). "
-            "You have specialized sub-agents: "
-            "1. 'greeting_agent': Handles simple greetings like 'Hi', 'Hello'. Delegate to it for these. "
-            "2. 'farewell_agent': Handles simple farewells like 'Bye', 'See you'. Delegate to it for these. "
-            "Analyze the user's query. If it's a greeting, delegate to 'greeting_agent'. If it's a farewell, delegate to 'farewell_agent'. "
-            "If it's a weather request, handle it yourself using 'get_weather'."
+            "You are the main Weather Agent. Your job is to provide weather using 'get_weather_stateful'. "
+            "The tool will format the temperature based on user preference stored in state. "
+            "Delegate simple greetings to 'greeting_agent' and farewells to 'farewell_agent'. "
+            "Handle only weather requests, greetings, and farewells."
         ),
-        tools=[get_weather],
-        sub_agents=[greeting_agent, farewell_agent]
+        tools=[get_weather_stateful],
+        sub_agents=[greeting_agent, farewell_agent],
+        output_key= "last_weather_report"
     )
     print(f"Root Agent {root_agent.name} created using model {root_agent_model} with sub-agents: {[sa.name for sa in root_agent.sub_agents]}")
+
+    runner_root_staterul = Runner(
+        agent=root_agent,
+        app_name=APP_NAME,
+        session_service= session_service_stateful
+    )
 
 else:
     print("Cannot create root agent because one or more sub-agents failed to initialize or 'get_weather' tool is missing.")
@@ -152,6 +214,6 @@ else:
 # Main execution
 if __name__ == "__main__":
     try:
-        asyncio.run(run_team_conversation())
+        asyncio.run(create_session())
     except Exception as e:
         print(f"An error occurred: {e}")
