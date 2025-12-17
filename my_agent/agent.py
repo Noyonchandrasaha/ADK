@@ -3,13 +3,14 @@ import asyncio
 from google.adk.agents import Agent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import Runner
 from google.genai import types
-from typing import Optional
+from typing import Optional, Dict, Any
 import warnings
 import logging
 import sys
@@ -57,6 +58,29 @@ async def create_session():
             print("Error: Could not retrieve session.")
     except Exception as e:
         print(f"Error during session creation: {e}")
+
+def bloack_paris_tool_guardrail(tool: BaseTool, args: Dict[str, Any], tool_context: ToolContext) -> Optional[Dict]:
+    """
+    Checks if 'get_weather_stateful' is called for 'Chandpur'.
+    If so, blocks the tool execution and returns a specific error dictionary.
+    Otherwise, allows the tool call to proceed by returing None.
+    """
+
+    tool_name= tool.name
+    agent_name = tool_context.agent_name
+    print(f"--- Callback: block_chandpur_tool_guardrail running for tool {tool_name} in agent {agent_name}")
+    print(f"--- Callback: Inspecting args: {args} ---")
+
+    # --Guardrail Logic ---
+    target_toll_name = "get_weather_stateful"
+    blocked_city = "chandpur"
+
+    # Check if it's the correct tool and the city argument matches the blocked city
+    if tool_name == target_toll_name:
+        city_argument = args.get("city", "")
+        if city_argument and city_argument.lower() == blocked_city:
+            print()
+
 
 def block_keyword_guardrail(callback_context: CallbackContext, llm_request: LlmRequest) -> Optional[LlmResponse]:
     """Inspects the latest user message for 'BLOCK'. If found, blocks the LLM call and returns a predefined LlmResponse, Otherwise, returns None to proceed."""
