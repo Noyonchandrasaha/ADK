@@ -1,126 +1,82 @@
-import asyncio
-import os
-from google.adk.agents import LoopAgent, LlmAgent, BaseAgent, SequentialAgent
+import httpx
+import litellm
+from typing import Optional
+from google.adk.agents.llm_agent import Agent
 from google.adk.models.lite_llm import LiteLlm
-from google.genai import types
-from google.adk.runners import InMemoryRunner
-from google.adk.agents.invocation_context import InvocationContext
-from google.adk.tools.tool_context import ToolContext
-from typing import AsyncGenerator, Optional
-from google.adk.events import Event, EventActions
 
-# -- Constants ---
-APP_NAME = 'doc_writing_app_v3'
-USER_ID = 'dev_user_01'
-SESSION_ID_BASE= "loop_exit_toll_session"
-GEMINI_MODEL = LiteLlm(model="openai/gpt-4o-mini")
-STATE_INITIAL_TOPIC = "initial_topic"
+# Tool to fetch a single product by its ID
+def get_product_details(product_id: str) -> dict:
+    """
+    Fetches full details for a specific product using its unique ID.
+    Use this when you have a product ID and need to know everything about that specific item.
+    """
+    try:
+        with httpx.Client() as client:
+            response = client.get(
+                f"http://localhost:8050/products/{product_id}",
+                timeout=10.0
+            )
+            if response.status_code == 404:
+                return {"error": f"Product with ID {product_id} not found."}
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        return {"error": f"Failed to fetch product details: {str(e)}"}
 
-# --- State Keys ---
-STATE_CURRENT_DOC = "current_document"
-STATE_CRITICISM = "criticism"
-# Define the exact phrase the Critic should use to signal completion
-COMPLETION_PHRASE = "No major issues found."
+# Advanced tool to fetch multiple products with filtering and sorting
+def search_products(
+    query: Optional[str] = None, 
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    sort_by: Optional[str] = "item_name",
+    sort_order: int = 1,
+    page: int = 1, 
+    limit: int = 10
+) -> dict:
+    """
+    Searches for products in the database with advanced filters.
+    Returns a list of products.
+    """
+    try:
+        params = {
+            "page": page, 
+            "limit": limit,
+            "sort_by": sort_by,
+            "sort_order": sort_order
+        }
+        if query: params["q"] = query
+        if category: params["category"] = category
+        if brand: params["brand"] = brand
+        if min_price is not None: params["min_price"] = min_price
+        if max_price is not None: params["max_price"] = max_price
+            
+        with httpx.Client() as client:
+            response = client.get(
+                "http://localhost:8050/products",
+                params=params,
+                timeout=10.0
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        return {"error": f"Failed to fetch products: {str(e)}"}
 
-# ---Tool Definitions---
-def exit_loop(tool_context: ToolContext):
-    """Call this function ONLY when the critique indicates no further changes are needed, signaling the iterative process should end."""
-    print(f"  [Tool Call] exit_loop triggered by {tool_context.agent_name}")
-    tool_context.actions.escalate = True
-    # Return empty dict as tools should typically return JSON-serializable output
-    return {}
-
-# --- Agent Definitions ---
-# STEP 1: Initial Writer Agent (Runs ONCE at the beginning)
-initial_writer_agent = LlmAgent(
-    name="initial_writer_agent",
-    model=GEMINI_MODEL,
-    include_contents='default',
-    instruction=f"""You are a Creative Writing Assistant tasked with starting a story.
-    Write the *first draft* of a short story (aim for 2-4 sentences).
-    Base the content *only* on the topic provided by the user. Try to introduce a specific element (like a character, a setting detail, or a starting action) to make it engaging.
-
-    Output *only* the story/document text. Do not add introductions or explanations.
-""",
-description="Writes the initial document draft based on the topic, aiming for some initial substance.",
-output_key = STATE_CURRENT_DOC
+root_agent = Agent(
+    model=LiteLlm(model='openai/gpt-3.5-turbo'),
+    name='product_recommender_agent',
+    description="A powerful product search and recommendation agent.",
+    instruction="""You are an expert Shopping Assistant. 
     
-)
-
-# STEP 2a: Critic Agent (Inside the Refinement Loop)
-critic_agent_in_loop = LlmAgent(
-    name="CriticAgent",
-    model=GEMINI_MODEL,
-    include_contents='none',
-    # MODIFIED Instruction: More nuanced completion criteria, look for clear improvement paths.
-    instruction=f"""You are a Constructive Critic AI reviewing a short document draft (typically 2-6 sentences). Your goal is balanced feedback.
-
-    **Document to Review:**
-
-    {{current_document}}
-
-
-    **Task:**
-    Review the document for clarity, engagement, and basic coherence according to the initial topic (if known).
-
-    IF you identify 1-2 *clear and actionable* ways the document could be improved to better capture the topic or enhance reader engagement (e.g., "Needs a stronger opening sentence", "Clarify the character's goal"):
-    Provide these specific suggestions concisely. Output *only* the critique text.
-
-    ELSE IF the document is coherent, addresses the topic adequately for its length, and has no glaring errors or obvious omissions:
-    Respond *exactly* with the phrase "{COMPLETION_PHRASE}" and nothing else. It doesn't need to be perfect, just functionally complete for this stage. Avoid suggesting purely subjective stylistic preferences if the core is sound.
-
-    Do not add explanations. Output only the critique OR the exact completion phrase.
-""",
-    description="Reviews the current draft, providing critique if clear improvements are needed, otherwise signals completion.",
-    output_key=STATE_CRITICISM
-)
-
-
-
-# STEP 2b: Refiner/Exiter Agent (Inside the Refinement Loop)
-refiner_agent_in_loop = LlmAgent(
-    name="RefinerAgent",
-    model=GEMINI_MODEL,
-    # Relies solely on state via placeholders
-    include_contents='none',
-    instruction=f"""You are a Creative Writing Assistant refining a document based on feedback OR exiting the process.
-    **Current Document:**
-    {{current_document}}
-    **Critique/Suggestions:**
-    {{criticism}}
-
-    **Task:**
-    Analyze the 'Critique/Suggestions'.
-    IF the critique is *exactly* "{COMPLETION_PHRASE}":
-    You MUST call the 'exit_loop' function. Do not output any text.
-    ELSE (the critique contains actionable feedback):
-    Carefully apply the suggestions to improve the 'Current Document'. Output *only* the refined document text.
-
-    Do not add explanations. Either output the refined document OR call the exit_loop function.
-""",
-    description="Refines the document based on critique, or calls exit_loop if critique indicates completion.",
-    tools=[exit_loop], # Provide the exit_loop tool
-    output_key=STATE_CURRENT_DOC # Overwrites state['current_document'] with the refined version
-)
-
-# STEP 2: Refinement Loop Agent
-refinement_loop = LoopAgent(
-    name="RefinementLoop",
-    # Agent order is crucial: Critique first, then Refine/Exit
-    sub_agents=[
-        critic_agent_in_loop,
-        refiner_agent_in_loop,
-    ],
-    max_iterations=5 # Limit loops
-)
-
-# STEP 3: Overall Sequential Pipeline
-# For ADK tools compatibility, the root agent must be named `root_agent`
-root_agent = SequentialAgent(
-    name="IterativeWritingPipeline",
-    sub_agents=[
-        initial_writer_agent, # Run first to create initial doc
-        refinement_loop       # Then run the critique/refine loop
-    ],
-    description="Writes an initial document and then iteratively refines it with critique using an exit tool."
+    TOOLS AT YOUR DISPOSAL:
+    1. 'search_products': Use this to browse inventory, search by name, filter by brand/price, or sort items.
+    2. 'get_product_details': Use this ONLY when you have a specific Product ID and need more information about that single item.
+    
+    GUIDELINES:
+    - If a user asks for a specific product ID (e.g., "tell me about 693a6897..."), use 'get_product_details'.
+    - If a user asks for a type of product or a brand, use 'search_products'.
+    - Always present the information in a professional and helpful manner.
+    """,
+    tools=[search_products, get_product_details],
 )
